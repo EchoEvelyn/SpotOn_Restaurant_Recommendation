@@ -2,32 +2,18 @@ import math
 
 
 def normalize_rating(rating: float | None) -> float:
-    """
-    Map Google rating (0-5) to 0-1.
-    Missing rating gets a neutral-but-not-strong score.
-    """
     if rating is None:
         return 0.5
     return max(0.0, min(rating / 5.0, 1.0))
 
 
 def normalize_review_count(count: int | None) -> float:
-    """
-    Compress review count with log scaling.
-    This helps distinguish between:
-    - very few reviews
-    - moderate review base
-    - highly reviewed places
-    """
     if not count:
         return 0.2
     return min(math.log(count + 1, 10) / 3.0, 1.0)
 
 
 def cuisine_match_score(types: list[str], prefs: dict) -> float:
-    """
-    Match requested cuisine against Google Places types.
-    """
     if not types:
         return 0.5
 
@@ -53,27 +39,20 @@ def cuisine_match_score(types: list[str], prefs: dict) -> float:
     }
 
     types_set = set(types)
-
     for cuisine in requested:
-        expected_types = cuisine_map.get(cuisine, [])
-        if any(t in types_set for t in expected_types):
+        if any(t in types_set for t in cuisine_map.get(cuisine, [])):
             return 1.0
 
     return 0.45
 
 
 def preference_match_score(restaurant: dict, prefs: dict) -> float:
-    """
-    Lightweight preference matching.
-    Since Places metadata is limited, this should only gently boost candidates.
-    """
     preferences = prefs.get("preferences", [])
     if not preferences:
         return 0.7
 
     types_text = " ".join(restaurant.get("types", [])).lower()
     name_text = (restaurant.get("name") or "").lower()
-
     score = 0.5
 
     if "healthy" in preferences:
@@ -88,13 +67,10 @@ def preference_match_score(restaurant: dict, prefs: dict) -> float:
 
     if "spicy" in preferences:
         score += 0.05
-
     if "light" in preferences:
         score += 0.05
-
     if "warm" in preferences or "comforting" in preferences:
         score += 0.05
-
     if "crispy" in preferences:
         score += 0.03
 
@@ -102,11 +78,6 @@ def preference_match_score(restaurant: dict, prefs: dict) -> float:
 
 
 def budget_match_score(restaurant: dict, prefs: dict) -> float:
-    """
-    Score how well the restaurant's price level matches user's budget preference.
-    Returns 1.0 for exact match, 0.6 for adjacent, 0.3 for mismatch.
-    If no budget preference or no price data, return neutral 0.7.
-    """
     budget_level = prefs.get("budget_level")
     if not budget_level:
         return 0.7
@@ -121,7 +92,6 @@ def budget_match_score(restaurant: dict, prefs: dict) -> float:
         "expensive": "PRICE_LEVEL_EXPENSIVE",
         "very_expensive": "PRICE_LEVEL_VERY_EXPENSIVE",
     }
-
     adjacent = {
         "cheap": {"PRICE_LEVEL_MODERATE"},
         "moderate": {"PRICE_LEVEL_INEXPENSIVE", "PRICE_LEVEL_EXPENSIVE"},
@@ -137,30 +107,15 @@ def budget_match_score(restaurant: dict, prefs: dict) -> float:
 
 
 def score_restaurant(restaurant: dict, prefs: dict) -> float:
-    rating_component = normalize_rating(restaurant.get("rating"))
-    review_component = normalize_review_count(restaurant.get("user_rating_count"))
-    cuisine_component = cuisine_match_score(restaurant.get("types", []), prefs)
-    preference_component = preference_match_score(restaurant, prefs)
-    budget_component = budget_match_score(restaurant, prefs)
-
     return (
-        0.35 * rating_component
-        + 0.17 * review_component
-        + 0.20 * cuisine_component
-        + 0.13 * preference_component
-        + 0.15 * budget_component
+        0.35 * normalize_rating(restaurant.get("rating"))
+        + 0.17 * normalize_review_count(restaurant.get("user_rating_count"))
+        + 0.20 * cuisine_match_score(restaurant.get("types", []), prefs)
+        + 0.13 * preference_match_score(restaurant, prefs)
+        + 0.15 * budget_match_score(restaurant, prefs)
     )
 
 
-def attach_scores(restaurants: list[dict], prefs: dict) -> list[dict]:
-    scored = []
-    for restaurant in restaurants:
-        item = dict(restaurant)
-        item["_score"] = score_restaurant(restaurant, prefs)
-        scored.append(item)
-    return scored
-
-
 def rank_restaurants(restaurants: list[dict], prefs: dict) -> list[dict]:
-    scored = attach_scores(restaurants, prefs)
+    scored = [{**r, "_score": score_restaurant(r, prefs)} for r in restaurants]
     return sorted(scored, key=lambda r: r["_score"], reverse=True)

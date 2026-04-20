@@ -1,3 +1,4 @@
+import math
 import os
 import html
 from copy import deepcopy
@@ -29,7 +30,6 @@ def initialize_state() -> None:
         "has_searched": False,
         "user_lat": None,
         "user_lng": None,
-        "nearby_suggestions": [],
         "location_error": "",
         "awaiting_followup": False,
         "pending_question_type": None,
@@ -170,34 +170,6 @@ def build_search_query(prefs: dict) -> str:
     return " ".join(terms).strip()
 
 
-def build_sidebar_text_from_prefs(prefs: dict) -> str:
-    parts = []
-
-    cuisines = prefs.get("cuisine") or []
-    if isinstance(cuisines, str):
-        cuisines = [cuisines]
-    if cuisines:
-        parts.extend(cuisines)
-
-    preferences = prefs.get("preferences") or []
-    if isinstance(preferences, str):
-        preferences = [preferences]
-    if preferences:
-        parts.extend(preferences)
-
-    if prefs.get("budget_level"):
-        parts.append(prefs["budget_level"])
-
-    if prefs.get("budget_max") is not None:
-        parts.append(f"under ${prefs['budget_max']}")
-
-    location_text = (prefs.get("location_text") or "").strip()
-    if location_text:
-        parts.append(location_text)
-
-    return ", ".join(parts)
-
-
 def make_followup_message(question_type: str, prefs: dict) -> str:
     if question_type == "location":
         if has_geo_context():
@@ -259,11 +231,7 @@ def detect_query_type(text: str) -> str:
         "thai", "japanese", "bbq", "brunch", "dimsum", "dim sum"
     }
 
-    if text in budget_words:
-        return "REFINE"
-    if text in location_words:
-        return "REFINE"
-    if text in cuisine_words:
+    if text in budget_words or text in location_words or text in cuisine_words:
         return "REFINE"
 
     if len(text.split()) >= 2:
@@ -493,49 +461,6 @@ def enrich_restaurants(restaurants: list[dict], top_k_for_llm: int = 5) -> list[
     return restaurants
 
 
-def load_nearby_suggestions() -> None:
-    if st.session_state.nearby_suggestions:
-        return
-
-    lat = st.session_state.user_lat
-    lng = st.session_state.user_lng
-
-    if lat is None or lng is None:
-        return
-
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        return
-
-    try:
-        tool = GooglePlacesTool(api_key)
-        nearby = tool.nearby_restaurants(
-            lat=lat,
-            lng=lng,
-            max_results=6,
-            radius_meters=2000,
-            include_reviews=False,
-        )
-
-        nearby = sorted(
-            nearby,
-            key=lambda x: (
-                x.get("rating") or 0,
-                x.get("user_rating_count") or 0,
-            ),
-            reverse=True,
-        )
-
-        st.session_state.nearby_suggestions = nearby[:3]
-
-    except Exception:
-        st.session_state.nearby_suggestions = []
-
-
-# =========================
-# Result analysis and search decisions
-# =========================
-
 def extract_price_bucket(price_level: str | None) -> str | None:
     mapping = {
         "PRICE_LEVEL_INEXPENSIVE": "cheap",
@@ -547,12 +472,10 @@ def extract_price_bucket(price_level: str | None) -> str | None:
 
 
 def result_price_buckets(results: list[dict]) -> list[str]:
-    buckets = []
-    for result in results:
-        bucket = extract_price_bucket(result.get("price_level"))
-        if bucket:
-            buckets.append(bucket)
-    return buckets
+    return [
+        bucket for result in results
+        if (bucket := extract_price_bucket(result.get("price_level")))
+    ]
 
 
 def unique_locations_from_results(results: list[dict]) -> set[str]:
@@ -762,193 +685,6 @@ def search_with_prefs(prefs: dict) -> dict:
     return {"results": final_results, "search_query": query}
 
 
-import math as _math
-
-
-def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    R = 6371.0
-    dlat = _math.radians(lat2 - lat1)
-    dlng = _math.radians(lng2 - lng1)
-    a = (_math.sin(dlat / 2) ** 2
-         + _math.cos(_math.radians(lat1)) * _math.cos(_math.radians(lat2)) * _math.sin(dlng / 2) ** 2)
-    return R * 2 * _math.atan2(_math.sqrt(a), _math.sqrt(1 - a))
-
-
-def _results_centroid(results: list[dict]) -> tuple[float, float] | None:
-    lats, lngs = [], []
-    for r in results:
-        lat = r.get("latitude") or r.get("lat")
-        lng = r.get("longitude") or r.get("lng") or r.get("lon")
-        if lat is not None and lng is not None:
-            lats.append(float(lat))
-            lngs.append(float(lng))
-    if not lats:
-        return None
-    return sum(lats) / len(lats), sum(lngs) / len(lngs)
-
-
-def _reverse_geocode_city(lat: float, lng: float) -> str | None:
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        return None
-    try:
-        url = f"https://maps.googleapis.com/maps/api/geocode/json?latlng={lat},{lng}&result_type=locality&key={api_key}"
-        resp = requests.get(url, timeout=5)
-        data = resp.json()
-        for result in data.get("results", []):
-            for comp in result.get("address_components", []):
-                if "locality" in comp.get("types", []):
-                    return comp["long_name"]
-    except Exception:
-        pass
-    return None
-
-
-def _check_location_drift(results: list[dict]) -> str | None:
-    """Return a soft-hint message if results are far from the user GPS position."""
-    if not has_geo_context():
-        return None
-    user_lat = st.session_state.user_lat
-    user_lng = st.session_state.user_lng
-
-    centroid = _results_centroid(results)
-
-    if centroid is not None:
-        # Coordinate-based check (most accurate)
-        dist_km = _haversine_km(user_lat, user_lng, centroid[0], centroid[1])
-        drifted = dist_km >= 50
-    else:
-        # Fallback: reverse-geocode the user city, then check result addresses
-        user_city = _reverse_geocode_city(user_lat, user_lng)
-        if not user_city or not results:
-            return None
-        city_lower = user_city.lower()
-        matches = sum(
-            1 for r in results
-            if city_lower in (r.get("address") or "").lower()
-        )
-        drifted = matches == 0
-
-    if not drifted:
-        return None
-
-    city = _reverse_geocode_city(user_lat, user_lng)
-    city_hint = f" in {city}" if city else ""
-    return f"These results don't seem to be near you. Try adding a city name{city_hint} to be more specific."
-
-
-
-def _geocode_location_text(location_text: str) -> dict | None:
-    """Return {lat, lng, city, state} for a location string, or None if not found."""
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        return None
-    try:
-        url = f"https://maps.googleapis.com/maps/api/geocode/json?address={requests.utils.quote(location_text)}&key={api_key}"
-        resp = requests.get(url, timeout=5)
-        data = resp.json()
-        results = data.get("results", [])
-        if not results:
-            return None
-        r = results[0]
-        loc = r["geometry"]["location"]
-        city, state = None, None
-        for comp in r.get("address_components", []):
-            types = comp.get("types", [])
-            if "locality" in types:
-                city = comp["long_name"]
-            elif city is None and ("sublocality" in types or "neighborhood" in types):
-                city = comp["long_name"]
-            if "administrative_area_level_1" in types:
-                state = comp["short_name"]
-        # Final fallback: use formatted_address if we still have no city
-        if city is None:
-            city = r.get("formatted_address", "").split(",")[0].strip() or None
-        return {"lat": loc["lat"], "lng": loc["lng"], "city": city, "state": state, "formatted_address": r.get("formatted_address", "")}
-    except Exception:
-        return None
-
-
-def _build_location_clarification_prompt(
-    location_text: str,
-    resolved: str | None,
-    user_city: str | None,
-    situation: str,
-) -> str:
-    user_city_str = user_city or "your current location"
-    if situation == "not_found":
-        context = (
-            f'The user typed "{location_text}" as a location, '
-            f"but it could not be matched to any known place. "
-            f"The user's GPS suggests they are near {user_city_str}."
-        )
-        instruction = (
-            f"Write a short, natural statement telling the user that you couldn't recognise "
-            f"\"{location_text}\" as a location, and that they should try being more specific "
-            f"(e.g. add a city name like {user_city_str})."
-        )
-    else:
-        context = (
-            f'The user typed "{location_text}" as a location. '
-            f"It was matched to {resolved or location_text}, "
-            f"which is far from the user's current GPS location near {user_city_str}."
-        )
-        instruction = (
-            f"Write a short, natural statement telling the user that you interpreted "
-            f"\"{location_text}\" as {resolved or location_text}, and that this seems far "
-            f"from their current location ({user_city_str}). "
-            f"Tell them to add a city name or be more specific if they meant somewhere near {user_city_str}. "
-            f"Do NOT ask a question — use declarative sentences only."
-        )
-    return f"""You are a friendly restaurant recommendation assistant writing a short UI message.
-
-{context}
-
-Instructions:
-{instruction}
-
-Rules:
-- Use declarative sentences only. No question marks.
-- 1-2 sentences maximum.
-- Be natural and friendly.
-- Do not mention GPS, geocoding, coordinates, or technical terms.
-- Return only the message text, nothing else.
-
-Message:""".strip()
-
-
-def _validate_location_text(location_text: str) -> str | None:
-    """Layer 1: pre-search location check.
-    Returns a message if the location is ambiguous or far away.
-    Returns None if location looks fine."""
-    if not has_geo_context():
-        return None
-    geo = _geocode_location_text(location_text)
-    user_lat = st.session_state.user_lat
-    user_lng = st.session_state.user_lng
-    user_city = _reverse_geocode_city(user_lat, user_lng)
-
-    # If short/abbreviation fails, try geocoding the full original user request
-    if geo is None and len(location_text.split()) <= 2:
-        full_input = (st.session_state.get("last_user_request") or "").strip()
-        if full_input and full_input.lower() != location_text.lower():
-            geo = _geocode_location_text(full_input)
-
-    if geo is None:
-        city_hint = f" in {user_city}" if user_city else ""
-        return f"I couldn't find '{location_text}' as a location. Try adding a city name{city_hint}."
-
-    dist_km = _haversine_km(user_lat, user_lng, geo["lat"], geo["lng"])
-    if dist_km >= 50:
-        formatted = geo.get("formatted_address") or ", ".join(filter(None, [geo.get("city"), geo.get("state")])) or location_text
-        user_city_str = f" in {user_city}" if user_city else ""
-        return (
-            f"Showing results near {formatted}. "
-            f"If you meant somewhere{user_city_str}, try adding a city name."
-        )
-
-    return None
-
 def apply_search_output(output: dict, prefs: dict) -> None:
     if "error" in output:
         st.session_state.results = []
@@ -976,15 +712,9 @@ def apply_search_output(output: dict, prefs: dict) -> None:
         st.session_state.assistant_prompt = decision["message"]
         st.session_state.status_message = decision["message"]
         sync_assistant_message()
-    elif decision["action"] == "recover":
+    elif decision["action"] in ("recover", "show_with_optional_hint"):
         st.session_state.awaiting_followup = False
-        st.session_state.pending_question_type = None
-        st.session_state.assistant_prompt = decision["message"]
-        st.session_state.status_message = decision["message"]
-        sync_assistant_message()
-    elif decision["action"] == "show_with_optional_hint":
-        st.session_state.awaiting_followup = False
-        st.session_state.pending_question_type = decision["question_type"]
+        st.session_state.pending_question_type = decision.get("question_type")
         st.session_state.assistant_prompt = decision["message"]
         st.session_state.status_message = decision["message"]
         sync_assistant_message()
@@ -1193,137 +923,6 @@ def build_reason(restaurant: dict, prefs: dict, rank_idx: int) -> str:
     return f"{opener}: {body}."
 
 
-def collect_active_filters(prefs: dict) -> list[dict]:
-    filters = []
-
-    cuisines = prefs.get("cuisine") or []
-    if isinstance(cuisines, str):
-        cuisines = [cuisines]
-    for cuisine in cuisines:
-        filters.append({
-            "kind": "cuisine",
-            "value": cuisine,
-            "label": f"🍜 {cuisine.title()}",
-        })
-
-    preferences = prefs.get("preferences") or []
-    if isinstance(preferences, str):
-        preferences = [preferences]
-    for preference in preferences:
-        filters.append({
-            "kind": "preference",
-            "value": preference,
-            "label": f"✨ {preference.title()}",
-        })
-
-    location_text = (prefs.get("location_text") or "").strip()
-    if location_text:
-        filters.append({
-            "kind": "location_text",
-            "value": location_text,
-            "label": f"📍 {location_text}",
-        })
-
-    if prefs.get("budget_level"):
-        filters.append({
-            "kind": "budget_level",
-            "value": prefs["budget_level"],
-            "label": f"💰 {prefs['budget_level'].title()}",
-        })
-
-    if prefs.get("budget_max") is not None:
-        filters.append({
-            "kind": "budget_max",
-            "value": prefs["budget_max"],
-            "label": f"💵 Under ${prefs['budget_max']}",
-        })
-
-    if prefs.get("distance_preference"):
-        filters.append({
-            "kind": "distance_preference",
-            "value": prefs["distance_preference"],
-            "label": f"🧭 {prefs['distance_preference'].title()}",
-        })
-
-    avoid = prefs.get("avoid") or []
-    if isinstance(avoid, str):
-        avoid = [avoid]
-    for item in avoid:
-        filters.append({
-            "kind": "avoid",
-            "value": item,
-            "label": f"🚫 No {item.title()}",
-        })
-
-    return filters
-
-
-def sync_sidebar_with_prefs() -> None:
-    current_text = build_sidebar_text_from_prefs(st.session_state.parsed_prefs)
-    st.session_state.search_text = current_text
-    st.session_state["sidebar_chat_input"] = current_text
-
-
-def remove_active_filter(kind: str, value) -> None:
-    prefs = deepcopy(st.session_state.parsed_prefs)
-
-    if kind == "cuisine":
-        items = prefs.get("cuisine") or []
-        if isinstance(items, str):
-            items = [items]
-        prefs["cuisine"] = [x for x in items if x != value]
-
-    elif kind == "preference":
-        items = prefs.get("preferences") or []
-        if isinstance(items, str):
-            items = [items]
-        prefs["preferences"] = [x for x in items if x != value]
-
-    elif kind == "location_text":
-        prefs["location_text"] = ""
-
-    elif kind == "budget_level":
-        prefs["budget_level"] = None
-
-    elif kind == "budget_max":
-        prefs["budget_max"] = None
-
-    elif kind == "distance_preference":
-        prefs["distance_preference"] = None
-
-    elif kind == "avoid":
-        items = prefs.get("avoid") or []
-        if isinstance(items, str):
-            items = [items]
-        prefs["avoid"] = [x for x in items if x != value]
-
-    st.session_state.parsed_prefs = prefs
-    sync_sidebar_with_prefs()
-    rerun_with_current_filters()
-
-
-def render_active_chips() -> None:
-    filters = collect_active_filters(st.session_state.parsed_prefs)
-    if not filters:
-        return
-
-    st.markdown('<div class="small-muted">Filters</div>', unsafe_allow_html=True)
-
-    rows = [filters[i:i + 3] for i in range(0, len(filters), 3)]
-    for row_idx, row in enumerate(rows):
-        cols = st.columns(len(row))
-        for i, f in enumerate(row):
-            label = f"{f['label']} ✕"
-            with cols[i]:
-                if st.button(
-                    label,
-                    key=f"filter_chip_{row_idx}_{i}_{f['kind']}_{f['value']}",
-                    use_container_width=True,
-                ):
-                    remove_active_filter(f["kind"], f["value"])
-                    st.rerun()
-
-
 def render_assistant_drawer() -> None:
     question_type = st.session_state.get("pending_question_type")
     quick_replies = get_quick_replies(question_type)
@@ -1413,20 +1012,16 @@ def render_assistant_drawer() -> None:
         st.markdown('<div class="send-btn-wrap">', unsafe_allow_html=True)
         clicked = st.button("Send", use_container_width=True, key="sidebar_send_button")
         st.markdown('</div>', unsafe_allow_html=True)
-        if clicked:
-            text = user_text.strip()
-            if text:
-                with st.spinner("Finding good spots..."):
-                    if st.session_state.get("pending_question_type"):
-                        apply_refinement(text)
-                    else:
-                        query_type = detect_query_type(text)
-                        if query_type == "NEW_QUERY":
-                            run_search(text)
-                        else:
-                            apply_refinement(text)
-                st.session_state.input_counter += 1
-                st.rerun()
+        if clicked and (text := user_text.strip()):
+            with st.spinner("Finding good spots..."):
+                if st.session_state.get("pending_question_type"):
+                    apply_refinement(text)
+                elif detect_query_type(text) == "NEW_QUERY":
+                    run_search(text)
+                else:
+                    apply_refinement(text)
+            st.session_state.input_counter += 1
+            st.rerun()
 
 
 def render_restaurant_card(restaurant: dict, prefs: dict, idx: int) -> None:
@@ -1506,70 +1101,6 @@ def render_restaurant_card(restaurant: dict, prefs: dict, idx: int) -> None:
     """
 
     st.markdown(card_html, unsafe_allow_html=True)
-
-
-def render_nearby_restaurant_card(place: dict, idx: int) -> None:
-    name = place.get("name", "Nearby restaurant")
-    rating = place.get("rating")
-    review_count = place.get("user_rating_count")
-    address = place.get("address", "")
-    photo_url = place.get("photo_url")
-    maps_uri = place.get("google_maps_uri")
-
-    short_address = address
-    if len(short_address) > 58:
-        short_address = short_address[:55].rstrip() + "..."
-
-    if rating is not None:
-        meta_text = f"⭐ {rating}"
-        if review_count:
-            meta_text += f" ({review_count} reviews)"
-    else:
-        meta_text = ""
-
-    image_html = (
-        f'<img src="{photo_url}" class="nearby-card-image">'
-        if photo_url else
-        """
-        <div style="
-            width:100%;
-            height:170px;
-            background:#f3f0ed;
-            border-radius:14px;
-            margin-bottom:14px;
-            display:flex;
-            align-items:center;
-            justify-content:center;
-            color:#a08b84;
-            font-size:15px;
-        ">
-            Nearby pick
-        </div>
-        """
-    )
-
-    link_html = ""
-    if maps_uri:
-        link_html = f"""
-        <div class="nearby-card-link" style="margin-top:6px;">
-            <a href="{maps_uri}" target="_blank">📍 Open in Google Maps</a>
-        </div>
-        """
-
-    st.markdown(
-        f"""
-        <div class="nearby-card-shell">
-            {image_html}
-            <div class="nearby-card-title" title="{name}">
-                {idx}. {name}
-            </div>
-            <div class="nearby-card-meta">{meta_text}</div>
-            <div class="nearby-card-address">{short_address}</div>
-            {link_html}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 
 def render_empty_state() -> None:
