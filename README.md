@@ -140,8 +140,6 @@ Each restaurant is scored across five dimensions:
 | Preference match (spicy, healthy, etc.) | 13% |
 | Budget match | 15% |
 
-The final score is multiplied by an avoid penalty (e.g. if the user said "no spicy").
-
 ---
 
 ## Google Places API setup
