@@ -1,4 +1,4 @@
-# SpotOn 🍜
+# ✨ SpotOn
 
 **Good food, without the endless searching.**
 
