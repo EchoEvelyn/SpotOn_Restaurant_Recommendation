@@ -87,7 +87,6 @@ def preference_match_score(restaurant: dict, prefs: dict) -> float:
             score += 0.2
 
     if "spicy" in preferences:
-        # No direct spicy tag in Places types; keep only a tiny neutral boost.
         score += 0.05
 
     if "light" in preferences:
@@ -100,24 +99,6 @@ def preference_match_score(restaurant: dict, prefs: dict) -> float:
         score += 0.03
 
     return min(score, 1.0)
-
-
-def avoid_penalty_score(restaurant: dict, prefs: dict) -> float:
-    """
-    Lightweight penalty for user avoid signals.
-    Avoid overconfidence because Places metadata is limited.
-    """
-    avoid = prefs.get("avoid", [])
-    if not avoid:
-        return 1.0
-
-    name_text = (restaurant.get("name") or "").lower()
-    penalty = 1.0
-
-    if "spicy" in avoid and "spicy" in name_text:
-        penalty -= 0.3
-
-    return max(penalty, 0.6)
 
 
 def budget_match_score(restaurant: dict, prefs: dict) -> float:
@@ -160,18 +141,15 @@ def score_restaurant(restaurant: dict, prefs: dict) -> float:
     review_component = normalize_review_count(restaurant.get("user_rating_count"))
     cuisine_component = cuisine_match_score(restaurant.get("types", []), prefs)
     preference_component = preference_match_score(restaurant, prefs)
-    avoid_component = avoid_penalty_score(restaurant, prefs)
     budget_component = budget_match_score(restaurant, prefs)
 
-    base_score = (
+    return (
         0.35 * rating_component
         + 0.17 * review_component
         + 0.20 * cuisine_component
         + 0.13 * preference_component
         + 0.15 * budget_component
     )
-
-    return base_score * avoid_component
 
 
 def attach_scores(restaurants: list[dict], prefs: dict) -> list[dict]:
