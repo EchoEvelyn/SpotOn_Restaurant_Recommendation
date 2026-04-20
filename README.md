@@ -8,6 +8,16 @@ Everything runs locally. No cloud AI subscriptions required.
 
 ---
 
+## Demo
+
+![Home](assets/screenshot_home.png)
+
+![Results](assets/screenshot_results.png)
+
+![Refined](assets/screenshot_refined.png)
+
+---
+
 ## How it works
 
 1. You type something like *"spicy Korean food near convoy"* or *"cheap ramen downtown"*
@@ -116,10 +126,10 @@ spoton/
 ├── schemas/
 │   └── schemas.py          # Preference schema and default values
 ├── services/
-│   ├── ranking.py          # Restaurant scoring and ranking algorithm
-│   └── recommend.py        # CLI entrypoint for standalone testing
+│   └── ranking.py          # Restaurant scoring and ranking algorithm
 ├── tools/
 │   └── google_places.py    # Google Places API wrapper (text search + nearby search)
+├── assets/                 # Screenshots for README
 ├── .env.example            # Environment variable template
 ├── .gitignore
 ├── requirements.txt
